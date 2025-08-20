@@ -1,0 +1,304 @@
+import tensorflow as tf
+import numpy as np
+import cv2
+import os
+import time
+from tkinter import Tk, Label, Button, Frame
+from PIL import Image, ImageTk
+import threading
+import sys
+from collections import deque
+
+# ==== CONFIG ====
+MODEL_PATH = 'sign_model.h5'
+DATASET_DIR = 'asl_dataset/asl_dataset'  # must match training structure
+IMAGE_SIZE = (224, 224)
+CONF_THRESHOLD = 0.7
+DEBOUNCE_INTERVAL = 1.0  # seconds between accepting same stable prediction
+SMOOTH_WINDOW = 5  # temporal smoothing size
+HAND_AREA_RATIO_THRESHOLD = 0.03  # heuristic for "hand present"
+DEBUG_SAVE_DIR = "debug_mispreds"  # where mispredictions go
+
+os.makedirs(DEBUG_SAVE_DIR, exist_ok=True)
+
+# ==== LOAD MODEL & LABELS ====
+model = tf.keras.models.load_model(MODEL_PATH)
+labels = sorted(os.listdir(DATASET_DIR))  # alphabet + special tokens
+label_map = {i: lbl for i, lbl in enumerate(labels)}
+inverse_label_map = {v: k for k, v in label_map.items()}
+
+# ==== GUI SETUP ====
+window = Tk()
+window.title("🤟 ASL Predictor — Enhanced Live")
+window.geometry("820x760")
+window.configure(bg="#1f2833")  # dark theme for contrast
+
+# Video display
+video_label = Label(window, bg="#0b0f1a")
+video_label.pack(pady=8)
+
+# Info panel
+info_frame = Frame(window, bg="#1f2833")
+info_frame.pack(pady=4, fill="x")
+
+result_text = Label(
+    info_frame,
+    text="Initializing...",
+    font=("Helvetica", 14, "bold"),
+    fg="#66fcf1",
+    bg="#1f2833",
+)
+result_text.grid(row=0, column=0, sticky="w", padx=6)
+
+confidence_label = Label(
+    info_frame,
+    text="Confidence: --",
+    font=("Helvetica", 12),
+    fg="#c5c6c7",
+    bg="#1f2833",
+)
+confidence_label.grid(row=1, column=0, sticky="w", padx=6)
+
+history_label = Label(
+    info_frame,
+    text="Recent: --",
+    font=("Helvetica", 12),
+    fg="#f1c40f",
+    bg="#1f2833",
+)
+history_label.grid(row=2, column=0, sticky="w", padx=6)
+
+final_word_label = Label(
+    window,
+    text="Final Word: ",
+    font=("Helvetica", 24, "bold"),
+    fg="#45a29e",
+    bg="#1f2833",
+)
+final_word_label.pack(pady=6)
+
+# Control buttons
+btn_frame = Frame(window, bg="#1f2833")
+btn_frame.pack(pady=6)
+
+start_button = Button(
+    btn_frame,
+    text="▶️ Start",
+    font=("Arial", 12),
+    bg="#66fcf1",
+    command=lambda: start_prediction(),
+)
+clear_word_button = Button(
+    btn_frame,
+    text="🧹 Clear Word (C)",
+    font=("Arial", 12),
+    bg="#ffb86c",
+    command=lambda: clear_word(),
+)
+clear_last_button = Button(
+    btn_frame,
+    text="↩️ Clear Last (L)",
+    font=("Arial", 12),
+    bg="#f1a6ff",
+    command=lambda: clear_last(),
+)
+quit_button = Button(
+    btn_frame,
+    text="🚪 Quit",
+    font=("Arial", 12),
+    bg="#ff5555",
+    command=lambda: quit_app(),
+)
+
+start_button.grid(row=0, column=0, padx=8)
+clear_word_button.grid(row=0, column=1, padx=8)
+clear_last_button.grid(row=0, column=2, padx=8)
+quit_button.grid(row=0, column=3, padx=8)
+
+# ==== STATE ====
+prediction_started = False
+accumulated_letters = []
+last_pred_time = 0
+pred_buffer = deque(maxlen=SMOOTH_WINDOW)
+recent_history = deque(maxlen=8)  # show last few stable preds
+
+# Debug labeling state
+pending_true_label = None  # set when user presses A-Z for this frame
+
+# ==== KEYBINDINGS ====
+def on_key(event):
+    global pending_true_label
+    c = event.char.lower()
+    if c == 'c':
+        clear_word()
+    elif c == 'l':
+        clear_last()
+    elif 'a' <= c <= 'z':
+        # Label current frame for debugging (uppercase)
+        pending_true_label = c.upper()
+        result_text.config(text=f"Labeling next hand frame as '{pending_true_label}'", fg="#ffb86c")
+
+
+window.bind("<Key>", on_key)
+
+
+# ==== HELPERS ====
+def preprocess_frame(frame):
+    img = cv2.resize(frame, IMAGE_SIZE)
+    img = img.astype('float32') / 255.0
+    img = np.expand_dims(img, axis=0)
+    return img
+
+
+def hand_present_heuristic(roi):
+    """Simple skin-color + contour heuristic to gate prediction."""
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lower = np.array([0, 30, 60])
+    upper = np.array([25, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return False
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    roi_area = roi.shape[0] * roi.shape[1]
+    return (area / roi_area) > HAND_AREA_RATIO_THRESHOLD
+
+
+def update_final_word_label():
+    final_word_label.config(text="Final Word: " + ''.join(accumulated_letters))
+
+
+def clear_word():
+    accumulated_letters.clear()
+    update_final_word_label()
+    result_text.config(text="Cleared word", fg="#66fcf1")
+
+
+def clear_last():
+    if accumulated_letters:
+        accumulated_letters.pop()
+        update_final_word_label()
+        result_text.config(text="Removed last letter", fg="#c5c6c7")
+    else:
+        result_text.config(text="Nothing to remove", fg="#ffb86c")
+
+
+def quit_app():
+    window.quit()
+    window.destroy()
+    sys.exit(0)
+
+
+# ==== DEBUG / PREDICTION FUNCTION ====
+def predict_and_debug(frame, true_label=None):
+    """
+    Returns (predicted_label, confidence) and logs/saves if misprediction
+    when true_label is provided.
+    """
+    inp = preprocess_frame(frame)
+    preds = model.predict(inp, verbose=0)[0]
+    top_conf = float(np.max(preds))
+    pred_idx = int(np.argmax(preds))
+    predicted_label = label_map[pred_idx]
+
+    # If user provided a true label and model got it wrong, dump debug info
+    if true_label is not None and predicted_label != true_label:
+        print("=== MISPREDICTION ===")
+        print(f"True: {true_label} | Pred: {predicted_label} ({top_conf:.2f})")
+        top3 = np.argsort(preds)[-3:][::-1]
+        for i in top3:
+            print(f"  {label_map[int(i)]}: {preds[int(i)]:.3f}")
+        ts = int(time.time())
+        safe_true = true_label.replace(" ", "_")
+        safe_pred = predicted_label.replace(" ", "_")
+        filename = os.path.join(
+            DEBUG_SAVE_DIR, f"debug_{safe_true}_as_{safe_pred}_{ts}.png"
+        )
+        cv2.imwrite(filename, frame)
+        print(f"Saved misprediction frame to {filename}")
+        result_text.config(
+            text=f"Misprediction logged: {true_label}→{predicted_label}", fg="#ff5656"
+        )
+
+    return predicted_label, top_conf
+
+
+# ==== PREDICTION LOOP ====
+def start_prediction():
+    global prediction_started
+    if prediction_started:
+        return
+    prediction_started = True
+    threading.Thread(target=update_frame, daemon=True).start()
+
+
+def update_frame():
+    global last_pred_time, pred_buffer, pending_true_label
+    cap = cv2.VideoCapture(0)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame = cv2.flip(frame, 1)
+
+        # ROI coordinates (adjust if needed)
+        x1, y1, x2, y2 = 100, 100, 400, 400
+        roi = frame[y1:y2, x1:x2]
+
+        # Background blur outside ROI
+        blurred = cv2.GaussianBlur(frame, (51, 51), 0)
+        display_frame = blurred.copy()
+        display_frame[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+
+        # ROI box
+        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (32, 255, 178), 3)
+
+        # Check for hand-like region
+        has_hand = hand_present_heuristic(roi)
+        if not has_hand:
+            result_text.config(text="No hand detected", fg="#ffb86c")
+            confidence_label.config(text="Confidence: --")
+        else:
+            # Prediction (with optional true label for debugging)
+            predicted_letter, top_conf = predict_and_debug(roi, true_label=pending_true_label)
+            # reset pending label after using it once
+            pending_true_label = None
+
+            # Temporal smoothing
+            pred_buffer.append(predicted_letter)
+            stable_pred = max(set(pred_buffer), key=pred_buffer.count)
+            recent_history.append(stable_pred)
+            history_label.config(text="Recent: " + ''.join(list(recent_history)))
+
+            if top_conf >= CONF_THRESHOLD:
+                current_time = time.time()
+                if current_time - last_pred_time > DEBOUNCE_INTERVAL:
+                    accumulated_letters.append(stable_pred)
+                    update_final_word_label()
+                    last_pred_time = current_time
+                result_text.config(text=f"Prediction: {stable_pred}", fg="#45a29e")
+                confidence_label.config(text=f"Confidence: {top_conf*100:.1f}%")
+            else:
+                result_text.config(text="Low confidence, holding...", fg="#dcdde1")
+                confidence_label.config(text=f"Confidence: {top_conf*100:.1f}%")
+
+        # Render frame to GUI
+        img_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+        img_tk = ImageTk.PhotoImage(image=img_pil)
+        video_label.imgtk = img_tk
+        video_label.configure(image=img_tk)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# auto-start
+start_prediction()
+window.mainloop()

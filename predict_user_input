@@ -1,0 +1,52 @@
+import tensorflow as tf
+import numpy as np
+import cv2
+import os
+from tkinter import Tk, filedialog
+from PIL import Image
+
+# Load your trained model
+model = tf.keras.models.load_model('sign_model.h5')
+
+# Get label names from your dataset folder
+labels = sorted(os.listdir('asl_dataset/asl_dataset'))
+
+# Function to preprocess the selected image
+def preprocess_image(image_path):
+    img = cv2.imread(image_path)
+    img = cv2.resize(img, (224, 224))
+    img = img.astype('float32') / 255.0
+    img = np.expand_dims(img, axis=0)
+    return img
+
+# Prediction function
+def predict(image_path):
+    img = preprocess_image(image_path)
+    preds = model.predict(img)
+    predicted_label = labels[np.argmax(preds)]
+    confidence = np.max(preds)
+    print(f"\n✅ Prediction: {predicted_label.upper()} ({confidence*100:.2f}% confidence)")
+
+    # Show the image with prediction
+    original = cv2.imread(image_path)
+    cv2.putText(original, f"{predicted_label.upper()} ({confidence*100:.2f}%)", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.imshow("Prediction", original)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# Open file browser
+def choose_image():
+    root = Tk()
+    root.withdraw()  # Hide the main Tkinter window
+    file_path = filedialog.askopenfilename(title="Choose a hand gesture image",
+                                           filetypes=[("Image files", "*.jpg *.jpeg *.png")])
+    return file_path
+
+if __name__ == '__main__':
+    image_path = choose_image()
+    if image_path:
+        print(f"\n📂 You chose: {image_path}")
+        predict(image_path)
+    else:
+        print("❌ No image selected.")
