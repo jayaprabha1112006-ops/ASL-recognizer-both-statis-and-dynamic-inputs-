@@ -1,8 +1,11 @@
 American Sign Language recognition system with static image and real-time webcam input using deep learning.
+
 To install the required modules : pip install tensorflow keras opencv-python streamlit numpy
+
 [Download ASL Dataset from Kaggle](https://kaggle.com/your-dataset-link)
 
 Files explanation:
+
 Train.py-
 Script to train the CNN/MobileNetV2 model on the ASL dataset.
 Running this script generates the trained model file (sign.h5).
